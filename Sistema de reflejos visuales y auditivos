@@ -1,0 +1,210 @@
+from machine import Pin, PWM, I2C
+import time, random
+from ssd1306 import SSD1306_I2C
+
+# -------------------------------
+# HARDWARE
+# -------------------------------
+# LEDs
+LED_PINS = [25, 33, 4]   # LED1, LED2, LED3
+leds = [Pin(p, Pin.OUT) for p in LED_PINS]
+
+# Buzzer
+buzzer = PWM(Pin(23))
+buzzer.duty(0)
+
+# Botones Jugador 1
+J1_PINS = [26, 27, 34, 12]   # LED1, LED2, LED3, BUZZ
+j1_btns = [Pin(p, Pin.IN, Pin.PULL_DOWN) for p in J1_PINS]
+
+# Botones Jugador 2
+J2_PINS = [16, 17, 5, 18]
+j2_btns = [Pin(p, Pin.IN, Pin.PULL_DOWN) for p in J2_PINS]
+
+# Botones extras
+BTN_START = Pin(13, Pin.IN, Pin.PULL_DOWN)  # Azul
+BTN_STOP  = Pin(2,  Pin.IN, Pin.PULL_DOWN)  # Gris
+BTN_IRQ   = Pin(19, Pin.IN, Pin.PULL_DOWN)  # Blanco
+
+# OLED opcional
+i2c = I2C(0, scl=Pin(21), sda=Pin(22))
+oled = SSD1306_I2C(128, 64, i2c)
+
+# -------------------------------
+# ESTADO DE JUEGO
+# -------------------------------
+puntaje = {"J1": 0, "J2": 0}
+ronda = 0
+modo_turbo = False
+last_irq_time = 0   # <-- Para antirrebote del botón turbo
+
+# -------------------------------
+# FUNCIONES DE UTILIDAD
+# -------------------------------
+def beep(t_ms=120, f=1000):
+    buzzer.freq(f)
+    buzzer.duty(512)
+    time.sleep_ms(t_ms)
+    buzzer.duty(0)
+
+def clear_outputs():
+    for l in leds: l.off()
+    buzzer.duty(0)
+
+def oled_msg(lines):
+    oled.fill(0)
+    y = 0
+    for ln in lines:
+        oled.text(ln, 0, y)
+        y += 10
+    oled.show()
+
+def any_pressed_debounced(btns):
+    """Devuelve índice del botón pulsado (una sola vez con antirrebote)."""
+    for idx, b in enumerate(btns):
+        if b.value() == 1:
+            while b.value() == 1:  # esperar a soltar
+                time.sleep_ms(10)
+            return idx
+    return None
+
+def mostrar_puntuacion():
+    msg = f"[SCORE] Ronda {ronda} | J1={puntaje['J1']}  J2={puntaje['J2']}"
+    print(msg)
+    oled_msg([f"Ronda: {ronda}",
+              f"J1: {puntaje['J1']}  J2: {puntaje['J2']}",
+              "Start=Jugar  Stop=Fin",
+              "Blanco=Turbo x2"])
+
+# -------------------------------
+# INTERRUPCIÓN: MODO TURBO
+# -------------------------------
+def on_irq(pin):
+    global modo_turbo, last_irq_time
+    now = time.ticks_ms()
+    # Antirrebote (ignora si pasan menos de 300 ms entre pulsaciones)
+    if time.ticks_diff(now, last_irq_time) < 300:
+        return
+    last_irq_time = now
+
+    # Cambiar estado turbo
+    modo_turbo = not modo_turbo
+    beep(60, 1500 if modo_turbo else 800)
+    estado = "ACTIVADO" if modo_turbo else "DESACTIVADO"
+    print(f"[IRQ] Modo TURBO {estado}")
+
+BTN_IRQ.irq(trigger=Pin.IRQ_RISING, handler=on_irq)
+
+# -------------------------------
+# JUEGO
+# -------------------------------
+def seleccionar_estimulo():
+    """0=LED1, 1=LED2, 2=LED3, 3=BUZZER"""
+    return random.randint(0, 3)
+
+def activar_estimulo(idx):
+    if idx < 3:
+        leds[idx].on()
+    else:
+        buzzer.freq(1200)
+        buzzer.duty(512)
+
+def desactivar_estimulo():
+    clear_outputs()
+
+def jugar_una_ronda(num_jugadores):
+    global ronda, puntaje
+    ronda += 1
+    mostrar_puntuacion()
+
+    # Delay previo
+    delay = random.uniform(0.5, 2.0) if modo_turbo else random.uniform(1.0, 10.0)
+    print(f"[INFO] Esperando {delay:.1f} seg antes del estímulo...")
+    time.sleep(delay)
+
+    # Estímulo
+    objetivo = seleccionar_estimulo()
+    activar_estimulo(objetivo)
+    t0 = time.ticks_ms()
+
+    ganador = None
+    reacc_ms = None
+
+    while True:
+        if BTN_STOP.value() == 1:  # abortar
+            desactivar_estimulo()
+            return "stop", None, None
+
+        idx1 = any_pressed_debounced(j1_btns)
+        idx2 = any_pressed_debounced(j2_btns) if num_jugadores == 2 else None
+
+        # Penalizaciones
+        if idx1 is not None and idx1 != objetivo:
+            puntaje["J1"] -= 1
+            print(f"[PENAL] J1 presionó {idx1} (objetivo={objetivo}) → -1 punto")
+            beep(80, 400)
+
+        if idx2 is not None and idx2 != objetivo:
+            puntaje["J2"] -= 1
+            print(f"[PENAL] J2 presionó {idx2} (objetivo={objetivo}) → -1 punto")
+            beep(80, 400)
+
+        # Aciertos
+        if idx1 == objetivo:
+            ganador = "J1"
+            reacc_ms = time.ticks_diff(time.ticks_ms(), t0)
+            break
+        if idx2 == objetivo:
+            ganador = "J2"
+            reacc_ms = time.ticks_diff(time.ticks_ms(), t0)
+            break
+
+        time.sleep_ms(5)
+
+    desactivar_estimulo()
+    puntos = 2 if modo_turbo else 1
+    puntaje[ganador] += puntos
+
+    print(f"[RONDA {ronda}] {ganador} acertó en {reacc_ms} ms (+{puntos} pts)")
+    mostrar_puntuacion()
+    return "ok", ganador, reacc_ms
+
+def juego():
+    global puntaje
+    print("=== Sistema de reflejos ===")
+    print("Selecciona jugadores: 1 o 2")
+    num_jugadores = int(input("> "))
+    if num_jugadores not in [1,2]:
+        num_jugadores = 2
+        print("Selección inválida → se asignan 2 jugadores por defecto")
+
+    puntaje = {"J1": 0, "J2": 0}
+    mostrar_puntuacion()
+    print("Presiona START para comenzar...")
+
+    while not BTN_START.value():
+        time.sleep_ms(30)
+    while BTN_START.value(): 
+        time.sleep_ms(10)
+
+    while True:
+        estado, ganador, tms = jugar_una_ronda(num_jugadores)
+        if estado == "stop":
+            break
+
+    # Final
+    ganador_final = "Empate"
+    if puntaje["J1"] > puntaje["J2"]:
+        ganador_final = "GANA J1"
+    elif puntaje["J2"] > puntaje["J1"]:
+        ganador_final = "GANA J2"
+    print(f"[FINAL] {ganador_final} | J1={puntaje['J1']}  J2={puntaje['J2']}")
+    oled_msg(["Juego terminado",
+              f"J1:{puntaje['J1']}  J2:{puntaje['J2']}",
+              ganador_final])
+
+# -------------------------------
+# MAIN
+# -------------------------------
+clear_outputs()
+juego()
