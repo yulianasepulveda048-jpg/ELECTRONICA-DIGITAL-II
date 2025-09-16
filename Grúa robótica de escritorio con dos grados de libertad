@@ -1,0 +1,277 @@
+"""
+MicroPython code for ESP32 — Desktop Robotic Crane (2 DOF)
+Compatible with Wokwi simulation and Thonny for physical upload.
+
+Features:
+- 2 potentiometers (ADC) -> manual control of 2 servos (base rotation and arm elevation)
+- 2 buttons with interrupts + software debounce
+   * button_return: forces return-to-home routine
+   * button_seq: runs a predefined movement sequence, then returns to pre-interrupt pose
+- LEDs: green = manual mode, red = automatic routine running
+- Buzzer: sounds while automatic routine runs
+- ADC1 width for potentiometer 1: 12-bit; potentiometer 2: 10-bit (as requested)
+
+Pin mapping (default, change as needed):
+- POT1 (base rot): GPIO34 (ADC1)
+- POT2 (arm elev): GPIO35 (ADC1)
+- SERVO1 (base): GPIO18 (PWM)
+- SERVO2 (arm): GPIO19 (PWM)
+- BUTTON_RETURN: GPIO14 (with internal pull-up)
+- BUTTON_SEQ: GPIO27 (with internal pull-up)
+- LED_GREEN: GPIO2
+- LED_RED: GPIO15
+- BUZZER: GPIO13
+
+Adjust constants below (servo pulse limits, speeds) to match your servos/hardware.
+
+Write to flash with Thonny or paste into Wokwi file and run.
+
+"""
+
+from machine import Pin, ADC, PWM
+import time
+
+# -------------------- CONFIG --------------------
+# Pins (change if needed)
+POT1_PIN = 34  # ADC - base rotation (12-bit)
+POT2_PIN = 35  # ADC - arm elevation (10-bit)
+SERVO1_PIN = 18  # base servo (PWM)
+SERVO2_PIN = 19  # arm servo (PWM)
+BUTTON_RETURN_PIN = 14
+BUTTON_SEQ_PIN = 27
+LED_GREEN_PIN = 2
+LED_RED_PIN = 15
+BUZZER_PIN = 13
+
+# ADC configuration
+# Pot1 -> 12-bit (0..4095)
+# Pot2 -> 10-bit (0..1023)
+
+# Servo/PWM config
+PWM_FREQ = 50  # 50 Hz for standard servos
+# Duty mapping constants (empirical) — tune these for your servos
+# For ESP32 PWM in MicroPython duty range is 0..1023
+SERVO_MIN_DUTY = 40   # pulse ~0.5ms
+SERVO_MAX_DUTY = 115  # pulse ~2.5ms
+
+# Servo angle limits
+ANGLE_MIN = 0
+ANGLE_MAX = 180
+
+# Movement speeds (ms delays between steps)
+MANUAL_UPDATE_MS = 50
+AUTO_STEP_DELAY_MS = 20  # smaller -> faster automatic moves
+ANGLE_STEP = 1  # degrees per step in automatic move
+
+# Debounce (ms)
+DEBOUNCE_MS = 200
+
+# Home/initial positions (degrees)
+HOME_SERVO1 = 90   # base centered
+HOME_SERVO2 = 0    # arm down
+
+# Predefined sequence (list of (angle1, angle2, hold_ms))
+PREDEFINED_SEQUENCE = [
+    (120, 60, 600),
+    (60, 30, 600),
+    (150, 90, 800),
+    (90, 0, 600),
+]
+
+# -------------------- HARDWARE SETUP --------------------
+# ADCs
+pot1 = ADC(Pin(POT1_PIN))
+pot1.width(ADC.WIDTH_12BIT)  # 0 - 4095
+pot1.atten(ADC.ATTN_11DB)    # full range approx
+
+pot2 = ADC(Pin(POT2_PIN))
+pot2.width(ADC.WIDTH_10BIT)  # 0 - 1023
+pot2.atten(ADC.ATTN_11DB)
+
+# PWM servos
+servo1 = PWM(Pin(SERVO1_PIN), freq=PWM_FREQ)
+servo2 = PWM(Pin(SERVO2_PIN), freq=PWM_FREQ)
+
+# LEDs and buzzer
+led_green = Pin(LED_GREEN_PIN, Pin.OUT)
+led_red = Pin(LED_RED_PIN, Pin.OUT)
+buzzer = Pin(BUZZER_PIN, Pin.OUT)
+
+# Buttons with pull-ups
+button_return = Pin(BUTTON_RETURN_PIN, Pin.IN, Pin.PULL_UP)
+button_seq = Pin(BUTTON_SEQ_PIN, Pin.IN, Pin.PULL_UP)
+
+# -------------------- GLOBAL STATE --------------------
+mode = 'manual'  # 'manual', 'auto_return', 'auto_sequence'
+return_flag = False
+sequence_flag = False
+last_press_return = 0
+last_press_seq = 0
+
+# Keep track of target servo angles (float)
+current_angle1 = HOME_SERVO1
+current_angle2 = HOME_SERVO2
+
+# -------------------- UTILITY FUNCTIONS --------------------
+
+def map_range(x, in_min, in_max, out_min, out_max):
+    # safe linear mapping
+    if in_max - in_min == 0:
+        return out_min
+    return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min
+
+
+def angle_to_duty(angle):
+    # clamp angle
+    if angle < ANGLE_MIN:
+        angle = ANGLE_MIN
+    if angle > ANGLE_MAX:
+        angle = ANGLE_MAX
+    # map angle 0..180 -> SERVO_MIN_DUTY..SERVO_MAX_DUTY
+    duty = int(map_range(angle, ANGLE_MIN, ANGLE_MAX, SERVO_MIN_DUTY, SERVO_MAX_DUTY))
+    return duty
+
+
+def set_servo_angles(a1, a2):
+    """Set both servos to given angles (degrees)."""
+    d1 = angle_to_duty(a1)
+    d2 = angle_to_duty(a2)
+    servo1.duty(d1)
+    servo2.duty(d2)
+
+
+# -------------------- INTERRUPT HANDLERS (debounced) --------------------
+
+def irq_return(pin):
+    global last_press_return, return_flag, mode
+    now = time.ticks_ms()
+    if time.ticks_diff(now, last_press_return) > DEBOUNCE_MS:
+        return_flag = True
+        # do not change mode here; main loop will handle switching
+        last_press_return = now
+
+
+def irq_sequence(pin):
+    global last_press_seq, sequence_flag, mode
+    now = time.ticks_ms()
+    if time.ticks_diff(now, last_press_seq) > DEBOUNCE_MS:
+        sequence_flag = True
+        last_press_seq = now
+
+
+# attach interrupts
+button_return.irq(trigger=Pin.IRQ_FALLING, handler=irq_return)
+button_seq.irq(trigger=Pin.IRQ_FALLING, handler=irq_sequence)
+
+# -------------------- AUTOMATIC ROUTINES --------------------
+
+def gradual_move_to(target1, target2, step_delay_ms=AUTO_STEP_DELAY_MS):
+    """Move current angles gradually to target angles."""
+    global current_angle1, current_angle2
+    # move servo1
+    while int(current_angle1) != int(target1) or int(current_angle2) != int(target2):
+        if int(current_angle1) < int(target1):
+            current_angle1 += ANGLE_STEP
+            if current_angle1 > target1:
+                current_angle1 = target1
+        elif int(current_angle1) > int(target1):
+            current_angle1 -= ANGLE_STEP
+            if current_angle1 < target1:
+                current_angle1 = target1
+        if int(current_angle2) < int(target2):
+            current_angle2 += ANGLE_STEP
+            if current_angle2 > target2:
+                current_angle2 = target2
+        elif int(current_angle2) > int(target2):
+            current_angle2 -= ANGLE_STEP
+            if current_angle2 < target2:
+                current_angle2 = target2
+        set_servo_angles(current_angle1, current_angle2)
+        time.sleep_ms(step_delay_ms)
+
+
+def auto_return_routine():
+    """Move to HOME positions, with LED/Buzzer on during move."""
+    led_green.off()
+    led_red.on()
+    buzzer.on()
+    gradual_move_to(HOME_SERVO1, HOME_SERVO2)
+    buzzer.off()
+    led_red.off()
+    led_green.on()
+
+
+def auto_sequence_routine(saved_angle1, saved_angle2):
+    """Run a predefined routine and then return to saved angles."""
+    led_green.off()
+    led_red.on()
+    buzzer.on()
+    # run sequence
+    for (a1, a2, hold_ms) in PREDEFINED_SEQUENCE:
+        gradual_move_to(a1, a2)
+        time.sleep_ms(hold_ms)
+    # after sequence, return to the angles the system had before interrupt
+    gradual_move_to(saved_angle1, saved_angle2)
+    buzzer.off()
+    led_red.off()
+    led_green.on()
+
+
+# -------------------- INITIAL STATE --------------------
+set_servo_angles(current_angle1, current_angle2)
+led_green.on()
+led_red.off()
+buzzer.off()
+
+print("Sistema inicializado. Modo manual activo.")
+
+# -------------------- MAIN LOOP --------------------
+try:
+    while True:
+        # Handle interrupts requested by ISR handlers
+        if return_flag:
+            # Clear flag and switch mode
+            return_flag = False
+            mode = 'auto_return'
+            print("Interrupción: retorno automático solicitado.")
+            auto_return_routine()
+            mode = 'manual'
+
+        if sequence_flag:
+            sequence_flag = False
+            mode = 'auto_sequence'
+            print("Interrupción: secuencia automática solicitada.")
+            # save current angles so we can return to them later
+            saved_a1 = current_angle1
+            saved_a2 = current_angle2
+            auto_sequence_routine(saved_a1, saved_a2)
+            mode = 'manual'
+
+        # Manual control (only active when not in auto routines)
+        if mode == 'manual':
+            # indicate manual
+            led_green.on()
+            led_red.off()
+            # read ADCs
+            raw1 = pot1.read()  # 0..4095
+            raw2 = pot2.read()  # 0..1023
+            # map to angles
+            a1 = map_range(raw1, 0, 4095, ANGLE_MIN, ANGLE_MAX)
+            a2 = map_range(raw2, 0, 1023, ANGLE_MIN, ANGLE_MAX)
+            current_angle1 = a1
+            current_angle2 = a2
+            set_servo_angles(current_angle1, current_angle2)
+            time.sleep_ms(MANUAL_UPDATE_MS)
+        else:
+            # small sleep while auto routines handle movement
+            time.sleep_ms(50)
+
+except KeyboardInterrupt:
+    print("Programa detenido por usuario.")
+    servo1.deinit()
+    servo2.deinit()
+    led_green.off()
+    led_red.off()
+    buzzer.off()
+
+# End of file
