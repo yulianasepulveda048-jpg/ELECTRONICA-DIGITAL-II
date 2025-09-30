@@ -1,0 +1,139 @@
+import machine
+import time
+import sys
+import uselect
+
+# Configuración ADC (señal ECG)
+adc = machine.ADC(machine.Pin(34))
+adc.atten(machine.ADC.ATTN_11DB)
+
+# Pines de desconexión de electrodos
+lo_plus = machine.Pin(25, machine.Pin.IN)
+lo_minus = machine.Pin(26, machine.Pin.IN)
+
+# LED indicador (adquisición activa)
+led = machine.Pin(2, machine.Pin.OUT)
+led.value(1)
+
+# Parámetros del filtro IIR
+alpha = 0.2
+lectura_exponencial = 0
+
+# Historial para filtros
+historial_promedio = []
+historial_mediana = []
+
+# Variables para opción 5 (graficar)
+BUFFER_SIZE = 150  # Número de muestras para graficar
+datos_crudo = []
+datos_exponencial = []
+datos_promedio = []
+datos_mediana = []
+
+# Selección inicial de filtro
+select = 0  # 0=crudo, 1=exponencial, 2=promedio, 3=mediana, 4=cascada, 5=graficar
+
+# Diccionario para nombrar filtros
+nombres_filtros = {
+    0: "Crudo",
+    1: "Exponencial",
+    2: "Promedio",
+    3: "Mediana",
+    4: "Todos en cascada",
+    5: "Graficar señales"
+}
+
+# --- Definición de filtros ---
+def filtro_exponencial(nueva_lectura, anterior, alpha=0.2):
+    return int(alpha * nueva_lectura + (1 - alpha) * anterior)
+
+def mean_filter(historial, samples=5):
+    if len(historial) < samples:
+        return historial[-1]
+    return sum(historial[-samples:]) // samples
+
+def median_filter(historial, samples=5):
+    if len(historial) < samples:
+        return historial[-1]
+    ventana = sorted(historial[-samples:])
+    return ventana[len(ventana) // 2]
+
+# Poller para leer consola sin bloquear
+poller = uselect.poll()
+poller.register(sys.stdin, uselect.POLLIN)
+
+try:
+    while True:
+        crudo = adc.read()
+
+        if select == 1:  # Exponencial
+            lectura_exponencial = filtro_exponencial(crudo, lectura_exponencial, alpha)
+            print("Crudo:", crudo, "Exponencial:", lectura_exponencial)
+
+        elif select == 2:  # Promedio
+            historial_promedio.append(crudo)
+            promedio = mean_filter(historial_promedio)
+            print("Crudo:", crudo, "Promedio:", promedio)
+
+        elif select == 3:  # Mediana
+            historial_mediana.append(crudo)
+            mediana = median_filter(historial_mediana)
+            print("Crudo:", crudo, "Mediana:", mediana)
+
+        elif select == 4:  # Cascada
+            lectura_exponencial = filtro_exponencial(crudo, lectura_exponencial, alpha)
+            historial_promedio.append(lectura_exponencial)
+            promedio = mean_filter(historial_promedio)
+            historial_mediana.append(promedio)
+            salida_final = median_filter(historial_mediana)
+            print("Crudo:", crudo, "→ Filtrado final (cascada):", salida_final)
+
+        elif select == 5:  # Recolección de datos para graficar
+            lectura_exponencial = filtro_exponencial(crudo, lectura_exponencial, alpha)
+
+            historial_promedio.append(crudo)
+            promedio = mean_filter(historial_promedio)
+
+            historial_mediana.append(crudo)
+            mediana = median_filter(historial_mediana)
+
+            datos_crudo.append(crudo)
+            datos_exponencial.append(lectura_exponencial)
+            datos_promedio.append(promedio)
+            datos_mediana.append(mediana)
+
+            if len(datos_crudo) >= BUFFER_SIZE:
+                print("START")  # Marca de inicio para el script en la PC
+                for i in range(BUFFER_SIZE):
+                    print("{},{},{},{}".format(
+                        datos_crudo[i],
+                        datos_exponencial[i],
+                        datos_promedio[i],
+                        datos_mediana[i]
+                    ))
+                print("END")  # Marca de fin
+                # Limpia buffers y vuelve a modo 0
+                datos_crudo.clear()
+                datos_exponencial.clear()
+                datos_promedio.clear()
+                datos_mediana.clear()
+                select = 0
+                print(">>> Datos enviados. Vuelve a modo CRUDO.")
+
+        else:  # Crudo
+            print("Crudo:", crudo)
+
+        if lo_plus.value() == 1 or lo_minus.value() == 1:
+            print("!!! Electrodos desconectados !!!")
+
+        if poller.poll(0):
+            entrada = sys.stdin.readline().strip()
+            if entrada.isdigit():
+                select = int(entrada)
+                print(">>> Filtro cambiado a", nombres_filtros.get(select, "Sin filtro"))
+
+        time.sleep_ms(100)
+
+except KeyboardInterrupt:
+    led.value(0)
+    print("\nAdquisición detenida. LED apagado.")
