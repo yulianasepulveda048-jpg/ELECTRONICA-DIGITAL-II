@@ -1,0 +1,395 @@
+import uasyncio as asyncio
+import network
+import ujson as json
+import time
+from machine import Pin, PWM
+import dht
+import os
+try:
+    import urequests as requests
+except:
+    import requests
+
+# ----- CONFIG -----
+WIFI_SSID = "JPRU"
+WIFI_PASS = "123456789"
+BOT_TOKEN = "8478234780:AAH9tD3weQ_uroI8niXb06NSdKigsZ50txs"    # tu token
+ADMIN_CHAT_ID = "8275251794"       # tu chat id (string o int)
+DHT_PIN = 14
+BUZZER_PIN = 12
+BUTTON_PIN = 13
+LED_PIN = 2
+THRESH_FILE = "thresholds.json"
+POLL_INTERVAL = 5   # seg para telegram polling
+SENSOR_INTERVAL = 4 # seg lectura sensor
+
+# ----- Hardware init -----
+dht_sensor = dht.DHT22(Pin(DHT_PIN))   # usa DHT22 si es el caso
+buzzer_pwm = PWM(Pin(BUZZER_PIN), freq=1000, duty=0)
+led = Pin(LED_PIN, Pin.OUT)
+button = Pin(BUTTON_PIN, Pin.IN, Pin.PULL_UP)
+
+# ----- util: persistencia de umbrales -----
+default_thresholds = {"temp": 30.0, "hum": 70.0, "alarm_enabled": True}
+def load_thresholds():
+    try:
+        with open(THRESH_FILE, "r") as f:
+            return json.load(f)
+    except:
+        save_thresholds(default_thresholds)
+        return default_thresholds
+
+def save_thresholds(th):
+    with open(THRESH_FILE, "w") as f:
+        f.write(json.dumps(th))
+
+thresholds = load_thresholds()
+
+# ----- WiFi connect -----
+def connect_wifi():
+    wlan = network.WLAN(network.STA_IF)
+    wlan.active(True)
+    if not wlan.isconnected():
+        print("Conectando a WiFi...")
+        wlan.connect(WIFI_SSID, WIFI_PASS)
+        t0 = time.time()
+        while not wlan.isconnected():
+            time.sleep(0.5)
+            if time.time() - t0 > 20:
+                print("No se pudo conectar a WiFi")
+                break
+    print("Conexión WiFi:", wlan.ifconfig())
+    return wlan.ifconfig()[0]
+
+# ----- Telegram helpers -----
+BASE_TELEGRAM = "https://api.telegram.org/bot{}/".format(BOT_TOKEN)
+
+def telegram_send(chat_id, text):
+    url = BASE_TELEGRAM + "sendMessage"
+    try:
+        payload = {"chat_id": chat_id, "text": text}
+        r = requests.post(url, json=payload, timeout=10)
+        # opcional: comprobar r.status_code
+        return True
+    except Exception as e:
+        print("Error enviando Telegram:", e)
+        return False
+
+last_update_id = None
+async def telegram_polling():
+    global last_update_id, thresholds
+    await asyncio.sleep(2)
+    while True:
+        try:
+            url = BASE_TELEGRAM + "getUpdates"
+            if last_update_id:
+                url += "?offset={}".format(last_update_id+1)
+            r = requests.get(url, timeout=10)
+            data = r.json()
+            if data.get("ok"):
+                for upd in data.get("result", []):
+                    last_update_id = upd["update_id"]
+                    # procesar mensaje
+                    if "message" in upd:
+                        chat = upd["message"]["chat"]["id"]
+                        text = upd["message"].get("text", "")
+                        print("Telegram msg:", chat, text)
+                        await handle_telegram_command(chat, text)
+        except Exception as e:
+            print("Err polling tg:", e)
+        await asyncio.sleep(POLL_INTERVAL)
+
+async def handle_telegram_command(chat, text):
+    global thresholds
+    t = text.strip()
+    if t.startswith("/status"):
+        # enviar estado actual
+        payload = "Estado:\nTemp umbral: {}°C\nHum umbral: {}%\nAlarmas: {}".format(
+            thresholds["temp"], thresholds["hum"], "ON" if thresholds["alarm_enabled"] else "OFF")
+        telegram_send(chat, payload)
+    elif t.startswith("/umbral"):
+        # formato: /umbral temp 28  OR /umbral hum 60
+        parts = t.split()
+        if len(parts) >= 3:
+            what = parts[1]
+            try:
+                val = float(parts[2])
+                if what.lower().startswith("t"):
+                    thresholds["temp"] = val
+                else:
+                    thresholds["hum"] = val
+                save_thresholds(thresholds)
+                telegram_send(chat, "Umbral actualizado: {}".format(json.dumps(thresholds)))
+            except:
+                telegram_send(chat, "Formato inválido. Ej: /umbral temp 28")
+        else:
+            telegram_send(chat, "Formato inválido. Ej: /umbral temp 28")
+    elif t.startswith("/alarmoff"):
+        thresholds["alarm_enabled"] = False
+        save_thresholds(thresholds)
+        stop_buzzer()
+        telegram_send(chat, "Alarmas desactivadas desde bot.")
+    elif t.startswith("/alarmon"):
+        thresholds["alarm_enabled"] = True
+        save_thresholds(thresholds)
+        telegram_send(chat, "Alarmas activadas desde bot.")
+    else:
+        telegram_send(chat, "Comandos: /status, /umbral temp|hum <valor>, /alarmoff, /alarmon")
+
+# ----- Buzzer control -----
+def play_tone(freq, duration_ms=500):
+    buzzer_pwm.freq(int(freq))
+    buzzer_pwm.duty(512)  # 50% duty
+    time.sleep_ms(duration_ms)
+    buzzer_pwm.duty(0)
+
+def start_buzzer_tone_for(kind):
+    # kind: "temp", "hum", "both"
+    if kind == "temp":
+        buzzer_pwm.freq(1200)
+    elif kind == "hum":
+        buzzer_pwm.freq(800)
+    else:
+        buzzer_pwm.freq(1000)
+    buzzer_pwm.duty(512)
+
+def stop_buzzer():
+    buzzer_pwm.duty(0)
+
+# ----- Estado global -----
+state = {
+    "temp": None,
+    "hum": None,
+    "temp_alarm": False,
+    "hum_alarm": False,
+    "panic": False,
+    "ip": None
+}
+
+# ----- Sensor loop -----
+async def sensor_loop():
+    global state, thresholds
+    while True:
+        try:
+            dht_sensor.measure()
+            t = dht_sensor.temperature()
+            h = dht_sensor.humidity()
+            state["temp"] = t
+            state["hum"] = h
+            # chequear umbrales
+            t_alarm = False
+            h_alarm = False
+            if thresholds.get("alarm_enabled", True):
+                if t is not None and t > thresholds["temp"]:
+                    t_alarm = True
+                if h is not None and h > thresholds["hum"]:
+                    h_alarm = True
+            state["temp_alarm"] = t_alarm
+            state["hum_alarm"] = h_alarm
+
+            # Buzzer logic: si ambas, diferente tono; si una, tono correspondiente
+            if t_alarm or h_alarm or state["panic"]:
+                led.on()  # 🔆 encender LED cuando hay alarma
+                if state["panic"]:
+                    start_buzzer_tone_for("both")
+                elif t_alarm and h_alarm:
+                    start_buzzer_tone_for("both")
+                elif t_alarm:
+                    start_buzzer_tone_for("temp")
+                elif h_alarm:
+                    start_buzzer_tone_for("hum")
+            else:
+                stop_buzzer()
+                led.off()  # 💡 apagar LED cuando no hay alarma
+            # Si se detecta alarma, enviar telegram (solo una vez por cambio)
+            await notify_if_needed()
+        except Exception as e:
+            print("Sensor error:", e)
+        await asyncio.sleep(SENSOR_INTERVAL)
+
+last_notified = {"temp": False, "hum": False, "panic": False}
+async def notify_if_needed():
+    global last_notified, state, thresholds
+    # temp
+    if state["temp_alarm"] and not last_notified["temp"]:
+        telegram_send(ADMIN_CHAT_ID, "ALERTA: temperatura alta: {}°C (umbral {})".format(state["temp"], thresholds["temp"]))
+        last_notified["temp"] = True
+    if not state["temp_alarm"]:
+        last_notified["temp"] = False
+    # hum
+    if state["hum_alarm"] and not last_notified["hum"]:
+        telegram_send(ADMIN_CHAT_ID, "ALERTA: humedad alta: {}% (umbral {})".format(state["hum"], thresholds["hum"]))
+        last_notified["hum"] = True
+    if not state["hum_alarm"]:
+        last_notified["hum"] = False
+    # panic
+    if state["panic"] and not last_notified["panic"]:
+        telegram_send(ADMIN_CHAT_ID, "ALERTA: botón de pánico presionado!")
+        last_notified["panic"] = True
+    if not state["panic"]:
+        last_notified["panic"] = False
+
+# ----- Button IRQ (pánico) -----
+debounce_ms = 300
+last_press = 0
+def button_handler(pin):
+    global state, last_press
+    t = time.ticks_ms()
+    if time.ticks_diff(t, last_press) < debounce_ms:
+        return
+    last_press = t
+    print("Botón presionado: PANIC")
+    state["panic"] = True
+    # arrancar buzzer inmediatamente
+    start_buzzer_tone_for("both")
+
+button.irq(trigger=Pin.IRQ_FALLING, handler=button_handler)
+
+# ----- Simple web server (HTTP) -----
+# Servir: / -> HTML UI
+#        /data -> JSON con estado
+#        /set_threshold -> recibe JSON {temp:..., hum:...}
+#        /alarm_off -> POST para apagar alarmas
+
+HTML_PAGE = """<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>ESP32 - Monitor</title></head>
+<body>
+<h2>Estado sensor</h2>
+<div>IP: <span id="ip">-</span></div>
+<div>Temperatura: <span id="temp">-</span> °C</div>
+<div>Humedad: <span id="hum">-</span> %</div>
+<div>Alarma Temp: <span id="talm">-</span></div>
+<div>Alarma Hum: <span id="halm">-</span></div>
+<button onclick="toggleAlarm()">Apagar alarmas</button>
+<h3>Configurar umbrales</h3>
+Temp:<input id="tval" type="number" step="0.1"><br>
+Hum:<input id="hval" type="number" step="1"><br>
+<button onclick="setUmbrales()">Guardar</button>
+<script>
+async function fetchData(){
+  try {
+    let r = await fetch('/data');
+    let j = await r.json();
+    document.getElementById('ip').innerText = j.ip || '-';
+    document.getElementById('temp').innerText = j.temp || '-';
+    document.getElementById('hum').innerText = j.hum || '-';
+    document.getElementById('talm').innerText = j.temp_alarm;
+    document.getElementById('halm').innerText = j.hum_alarm;
+    document.getElementById('tval').value = j.thresholds.temp;
+    document.getElementById('hval').value = j.thresholds.hum;
+  } catch(e) {
+    console.log('err',e);
+  }
+}
+async function setUmbrales(){
+  let t = parseFloat(document.getElementById('tval').value);
+  let h = parseFloat(document.getElementById('hval').value);
+  await fetch('/set_threshold', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({temp:t,hum:h})});
+  fetchData();
+}
+async function toggleAlarm(){
+  await fetch('/alarm_off', {method:'POST'});
+  fetchData();
+}
+setInterval(fetchData, 2000);
+fetchData();
+</script>
+</body>
+</html>
+"""
+
+async def handle_client(reader, writer):
+    try:
+        req = await reader.readline()
+        if not req:
+            await writer.aclose()
+            return
+        # parse request line
+        req_line = req.decode()
+        method, path, _ = req_line.split()
+        # skip headers
+        while True:
+            h = await reader.readline()
+            if not h or h == b'\r\n':
+                break
+        if path == '/' and method == 'GET':
+            resp = HTML_PAGE
+            writer.write('HTTP/1.0 200 OK\r\nContent-Type: text/html\r\n\r\n')
+            writer.write(resp)
+            await writer.drain()
+        elif path == '/data' and method == 'GET':
+            payload = {
+                "temp": state["temp"],
+                "hum": state["hum"],
+                "temp_alarm": state["temp_alarm"],
+                "hum_alarm": state["hum_alarm"],
+                "panic": state["panic"],
+                "ip": state.get("ip"),
+                "thresholds": thresholds
+            }
+            js = json.dumps(payload)
+            writer.write('HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n')
+            writer.write(js)
+            await writer.drain()
+        elif path == '/set_threshold' and method == 'POST':
+            # read body
+            body = await reader.read()  # read rest
+            try:
+                body_s = body.decode()
+                data = json.loads(body_s)
+                thresholds["temp"] = float(data.get("temp", thresholds["temp"]))
+                thresholds["hum"] = float(data.get("hum", thresholds["hum"]))
+                save_thresholds(thresholds)
+                writer.write('HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n\r\nOK')
+                await writer.drain()
+            except Exception as e:
+                writer.write('HTTP/1.0 400 Bad Request\r\n\r\nERR')
+                await writer.drain()
+        elif path == '/alarm_off' and method == 'POST':
+            thresholds["alarm_enabled"] = False
+            save_thresholds(thresholds)
+            state["panic"] = False
+            stop_buzzer()
+            writer.write('HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n\r\nOK')
+            await writer.drain()
+        else:
+            writer.write('HTTP/1.0 404 Not Found\r\n\r\n')
+            await writer.drain()
+        await writer.aclose()
+    except Exception as e:
+        print("HTTP handler error:", e)
+        try:
+            await writer.aclose()
+        except:
+            pass
+
+async def web_server():
+    import socket
+    s = await asyncio.start_server(handle_client, "0.0.0.0", 80)
+    print("Web server started on port 80")
+    await s.wait_closed()
+
+# ----- Main -----
+async def main():
+    ip = connect_wifi()
+    state["ip"] = ip
+    # notify telegram of IP on start
+    try:
+        telegram_send(ADMIN_CHAT_ID, "ESP32 iniciado. IP: {}".format(ip))
+    except:
+        print("No se pudo avisar por Telegram al iniciar.")
+    # Run tasks
+    tasks = [
+        asyncio.create_task(sensor_loop()),
+        asyncio.create_task(telegram_polling()),
+        asyncio.create_task(web_server()),
+    ]
+    await asyncio.gather(*tasks)
+
+# run loop
+try:
+    asyncio.run(main())
+finally:
+    stop_buzzer()
+    asyncio.new_event_loop()
