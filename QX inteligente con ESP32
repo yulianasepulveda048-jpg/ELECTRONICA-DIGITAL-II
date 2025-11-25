@@ -1,0 +1,528 @@
+# main.py - QxBioSafe (HTTP + Telegram) - ESP32-S
+# MicroPython (Thonny) - Usa BME280, DHT22, BH1750, MQ-135, SHARP GP2Y1010, PIR
+# Actuadores: RELAY, BUZZER, LED, SERVO
+# Edita la sección CONFIG antes de ejecutar
+
+import uasyncio as asyncio
+import network
+import time
+import ujson as json
+from machine import Pin, ADC, I2C, PWM
+try:
+    import urequests as requests
+except:
+    import requests
+
+# Drivers (asegúrate de subir bme280.py y bh1750.py al dispositivo)
+try:
+    from bme280 import BME280
+except Exception as e:
+    BME280 = None
+    print("bme280 driver missing:", e)
+try:
+    from bh1750 import BH1750
+except Exception as e:
+    BH1750 = None
+    print("bh1750 driver missing:", e)
+
+# -------------------- CONFIG --------------------
+WIFI_SSID = "TU_SSID_AQUI"
+WIFI_PASS = "TU_PASS_AQUI"
+
+# Telegram (token y chat id ya proporcionados)
+TELEGRAM_BOT = "8478234780:AAH9tD3weQ_uroI8niXb06NSdKigsZ50txs"
+ADMIN_CHAT_ID = "8275251794"
+
+# Umbrales iniciales (ajustar después)
+THRESH = {
+    "temp": 26.0,      # °C
+    "hum": 60.0,       # %
+    "voc_adc": 800,    # MQ-135 ADC umbral (ajustar)
+    "pm_adc": 400      # SHARP VO umbral (ajustar)
+}
+
+POLL_TELEGRAM = 4      # s entre polling de Telegram
+SENSOR_INTERVAL = 4    # s entre lecturas
+ALERT_COOLDOWN = 60    # s entre alertas Telegram repetidas
+
+# -------------------- PINS (ajusta si tu placa usa otros pines) --------------------
+# I2C (BME280 y BH1750)
+I2C_SDA = 21
+I2C_SCL = 22
+
+# Sensores / ADC / Digital
+DHT_PIN = 13           # DHT22 data
+PIR_PIN = 27           # PIR OUT
+MQ_ADC_PIN = 34        # MQ-135 analog out (ADC)
+SHARP_LED_PIN = 25     # SHARP LED drive (pulse)
+SHARP_VO_PIN = 35      # SHARP analog output (ADC)
+
+# Actuadores
+RELAY_PIN =         # Relay IN
+BUZZER_PIN = 4       # Buzzer (PWM)
+LED_PIN = 2            # Status LED
+SERVO_PIN = 14         # Servo PWM (SG90)
+
+# -------------------- FIN CONFIG --------------------
+
+# ---------- hardware init ----------
+i2c = I2C(0, scl=Pin(I2C_SCL), sda=Pin(I2C_SDA))
+bme = None
+lux = None
+if BME280:
+    try:
+        bme = BME280(i2c=i2c)
+    except Exception as e:
+        print("BME init error:", e)
+if BH1750:
+    try:
+        lux = BH1750(i2c=i2c)
+    except Exception as e:
+        print("BH1750 init error:", e)
+
+# DHT22
+try:
+    import dht
+    dht_sensor = dht.DHT22(Pin(DHT_PIN))
+except Exception as e:
+    dht_sensor = None
+    print("DHT driver missing:", e)
+
+# Digital and ADC
+pir = Pin(PIR_PIN, Pin.IN)
+mq_adc = ADC(Pin(MQ_ADC_PIN))
+mq_adc.atten(ADC.ATTN_11DB)
+sharp_led = Pin(SHARP_LED_PIN, Pin.OUT)
+sharp_vo = ADC(Pin(SHARP_VO_PIN))
+sharp_vo.atten(ADC.ATTN_11DB)
+
+relay = Pin(RELAY_PIN, Pin.OUT)
+buzzer = PWM(Pin(BUZZER_PIN), freq=1000, duty=0)
+status_led = Pin(LED_PIN, Pin.OUT)
+servo = PWM(Pin(SERVO_PIN), freq=50)  # SG90 50Hz
+
+# servo helper: convert angle (0..180) -> duty for ESP32 PWM
+def servo_write_angle(angle):
+    # adjust these if servo doesn't reach extremes
+    min_duty = 40    # ~0.5ms
+    max_duty = 115   # ~2.5ms
+    angle = max(0, min(180, int(angle)))
+    duty = int(min_duty + (max_duty - min_duty) * (angle / 180.0))
+    try:
+        servo.duty(duty)
+    except Exception:
+        try:
+            servo.duty_u16(int((duty / 1023) * 65535))
+        except:
+            pass
+
+# -------------------- networking --------------------
+wlan = network.WLAN(network.STA_IF)
+
+def connect_wifi(timeout=25):
+    wlan.active(True)
+    if wlan.isconnected():
+        print("Already connected:", wlan.ifconfig())
+        return True
+    print("Connecting to WiFi...")
+    wlan.connect(WIFI_SSID, WIFI_PASS)
+    t0 = time.time()
+    while not wlan.isconnected():
+        time.sleep(0.5)
+        if time.time() - t0 > timeout:
+            print("WiFi connect timeout")
+            return False
+    print("Connected, IP:", wlan.ifconfig())
+    return True
+
+# -------------------- Telegram --------------------
+BASE_TELEGRAM = "https://api.telegram.org/bot{}/".format(TELEGRAM_BOT)
+last_update_id = None
+
+def telegram_send(chat_id, text):
+    try:
+        url = BASE_TELEGRAM + "sendMessage"
+        payload = {"chat_id": chat_id, "text": text}
+        r = requests.post(url, json=payload, timeout=8)
+        # optionally: check r.status_code
+        return True
+    except Exception as e:
+        print("Telegram send error:", e)
+        return False
+
+async def telegram_polling():
+    global last_update_id
+    await asyncio.sleep(1)
+    while True:
+        try:
+            url = BASE_TELEGRAM + "getUpdates"
+            if last_update_id:
+                url += "?offset={}".format(last_update_id + 1)
+            r = requests.get(url, timeout=8)
+            data = r.json()
+            if data.get("ok"):
+                for upd in data.get("result", []):
+                    last_update_id = upd["update_id"]
+                    if "message" in upd:
+                        chat = upd["message"]["chat"]["id"]
+                        text = upd["message"].get("text", "")
+                        print("TG msg:", chat, text)
+                        await handle_telegram_command(chat, text)
+        except Exception as e:
+            # non-blocking: just log and continue
+            print("Telegram polling error:", e)
+        await asyncio.sleep(POLL_TELEGRAM)
+
+async def handle_telegram_command(chat, text):
+    t = (text or "").strip()
+    if not t:
+        return
+    tlow = t.lower()
+    if tlow == "/status":
+        s = get_state_snapshot()
+        msg = "Estado QxBioSafe\nTemp: {:.1f}°C\nHum: {:.1f}%\nVOC(adc): {}\nPM(raw): {}\nLux: {}\nPresencia: {}\nEstado: {}".format(
+            s["temp"] or -1, s["hum"] or -1, s["voc_adc"], s["pm_raw"], s["lux"], s["pir"], s["system_state"]
+        )
+        telegram_send(chat, msg)
+    elif tlow.startswith("/set "):
+        # formato: /set temp 25
+        parts = t.split()
+        if len(parts) >= 3:
+            key = parts[1]
+            try:
+                val = float(parts[2])
+                if key in THRESH:
+                    THRESH[key] = val
+                    telegram_send(chat, "Umbral {} actualizado: {}".format(key, val))
+                else:
+                    telegram_send(chat, "Clave no reconocida. Claves: " + ", ".join(list(THRESH.keys())))
+            except:
+                telegram_send(chat, "Valor inválido")
+        else:
+            telegram_send(chat, "Formato: /set <clave> <valor>")
+    elif tlow == "/vent on":
+        relay.value(1)
+        telegram_send(chat, "Ventilación activada")
+    elif tlow == "/vent off":
+        relay.value(0)
+        telegram_send(chat, "Ventilación desactivada")
+    elif tlow == "/alarm off":
+        stop_buzzer()
+        telegram_send(chat, "Alarmas desactivadas (local)")
+    elif tlow == "/help":
+        telegram_send(chat, "/status\n/set <clave> <valor>\n/vent on\n/vent off\n/alarm off")
+    else:
+        telegram_send(chat, "Comando no reconocido. /help")
+
+# -------------------- sensor read helpers --------------------
+state = {
+    "temp": None,
+    "hum": None,
+    "pres": None,
+    "lux": None,
+    "voc_adc": None,
+    "pm_raw": None,
+    "pir": 0,
+    "system_state": "INIT",
+    "ip": None
+}
+
+def read_dht():
+    if not dht_sensor:
+        return None, None
+    try:
+        dht_sensor.measure()
+        return dht_sensor.temperature(), dht_sensor.humidity()
+    except Exception as e:
+        print("DHT read error:", e)
+        return None, None
+
+def read_bme():
+    if not bme:
+        return None, None, None
+    try:
+        t, p, h = bme.read()
+        return t, h, p
+    except Exception as e:
+        print("BME read error:", e)
+        return None, None, None
+
+def read_lux():
+    if not lux:
+        return None
+    try:
+        return lux.luminance()
+    except Exception:
+        try:
+            return lux.lux()
+        except Exception as e:
+            print("Lux read error:", e)
+            return None
+
+def read_mq135():
+    try:
+        return mq_adc.read()   # 0..4095
+    except Exception as e:
+        print("MQ read error:", e)
+        return None
+
+def read_sharp():
+    try:
+        # pulse led, wait microseconds, read analog
+        sharp_led.value(1)
+        time.sleep_us(280)
+        val = sharp_vo.read()
+        sharp_led.value(0)
+        time.sleep_us(40)
+        return val
+    except Exception as e:
+        print("Sharp read error:", e)
+        return None
+
+# -------------------- buzzer --------------------
+def start_buzzer(freq=1200):
+    try:
+        buzzer.freq(freq)
+        buzzer.duty(512)
+    except:
+        try:
+            buzzer.duty_u16(32768)
+        except:
+            pass
+
+def stop_buzzer():
+    try:
+        buzzer.duty(0)
+    except:
+        try:
+            buzzer.duty_u16(0)
+        except:
+            pass
+
+# -------------------- risk & actions --------------------
+last_alert_time = 0
+
+def compute_score(voc_adc, pm_raw, temp, hum):
+    s = 0
+    if voc_adc and voc_adc > THRESH["voc_adc"]:
+        s += 1
+    if pm_raw and pm_raw > THRESH["pm_adc"]:
+        s += 1
+    if temp and temp > THRESH["temp"]:
+        s += 1
+    if hum and hum > THRESH["hum"]:
+        s += 1
+    return s
+
+def get_state_snapshot():
+    return {
+        "temp": state.get("temp"),
+        "hum": state.get("hum"),
+        "pres": state.get("pres"),
+        "lux": state.get("lux"),
+        "voc_adc": state.get("voc_adc"),
+        "pm_raw": state.get("pm_raw"),
+        "pir": state.get("pir"),
+        "system_state": state.get("system_state"),
+        "ip": state.get("ip")
+    }
+
+# -------------------- web server (HTTP) --------------------
+HTML = """<!doctype html>
+<html><head><meta charset="utf-8"><title>QxBioSafe</title>
+<style>
+body{font-family:Arial;margin:12px;background:#f4f4f4}
+.card{background:#fff;padding:12px;border-radius:8px;margin-bottom:10px;box-shadow:0 1px 4px rgba(0,0,0,0.08)}
+button{padding:8px 12px;margin:4px}
+.status{font-weight:bold}
+</style>
+</head><body>
+<h2>QxBioSafe - Quirófano</h2>
+<div class="card">
+IP: <span id="ip">-</span><br>
+Estado: <span id="state">-</span><br>
+Temp: <span id="temp">-</span> °C<br>
+Hum: <span id="hum">-</span> %<br>
+VOC(adc): <span id="voc">-</span><br>
+PM(raw): <span id="pm">-</span><br>
+Lux: <span id="lux">-</span><br>
+Presencia: <span id="pir">-</span><br>
+</div>
+<div class="card">
+<h3>Controles</h3>
+<button onclick="act('rele','on')">Vent ON</button>
+<button onclick="act('rele','off')">Vent OFF</button>
+<button onclick="act('buzzer','on')">Alarm ON</button>
+<button onclick="act('buzzer','off')">Alarm OFF</button>
+<button onclick="servo(0)">Servo 0°</button>
+<button onclick="servo(90)">Servo 90°</button>
+<button onclick="servo(180)">Servo 180°</button>
+</div>
+<script>
+async function fetchData(){
+  try {
+    let r = await fetch('/estado');
+    let j = await r.json();
+    document.getElementById('ip').innerText = j.ip || '-';
+    document.getElementById('state').innerText = j.system_state || '-';
+    document.getElementById('temp').innerText = j.temp || '-';
+    document.getElementById('hum').innerText = j.hum || '-';
+    document.getElementById('voc').innerText = j.voc_adc || '-';
+    document.getElementById('pm').innerText = j.pm_raw || '-';
+    document.getElementById('lux').innerText = j.lux || '-';
+    document.getElementById('pir').innerText = j.pir || '-';
+  } catch(e){ console.log(e) }
+}
+async function act(device, action){
+  await fetch('/accion', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({device:device,action:action})});
+  fetchData();
+}
+async function servo(a){
+  await fetch('/accion', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({device:'servo',action:a})});
+}
+setInterval(fetchData,2000);
+fetchData();
+</script>
+</body></html>
+"""
+
+async def http_handler(reader, writer):
+    try:
+        req = await reader.readline()
+        if not req:
+            await writer.aclose()
+            return
+        line = req.decode()
+        try:
+            method, path, _ = line.split()
+        except:
+            await writer.aclose()
+            return
+        # skip headers
+        while True:
+            h = await reader.readline()
+            if not h or h == b'\r\n':
+                break
+        if path == '/' and method == 'GET':
+            writer.write('HTTP/1.0 200 OK\r\nContent-Type: text/html\r\n\r\n')
+            writer.write(HTML)
+            await writer.drain()
+        elif path == '/estado' and method == 'GET':
+            payload = json.dumps(get_state_snapshot())
+            writer.write('HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n')
+            writer.write(payload)
+            await writer.drain()
+        elif path == '/accion' and method == 'POST':
+            body = await reader.read()
+            try:
+                data = json.loads(body.decode())
+                dev = data.get("device")
+                act = data.get("action")
+                if dev == "rele":
+                    if str(act).lower() == "on":
+                        relay.value(1)
+                    else:
+                        relay.value(0)
+                elif dev == "buzzer":
+                    if str(act).lower() == "on":
+                        start_buzzer()
+                    else:
+                        stop_buzzer()
+                elif dev == "servo":
+                    try:
+                        ang = int(act)
+                        servo_write_angle(max(0, min(180, ang)))
+                    except:
+                        pass
+                writer.write('HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n\r\nOK')
+                await writer.drain()
+            except Exception as e:
+                writer.write('HTTP/1.0 400 Bad Request\r\n\r\nERR')
+                await writer.drain()
+        else:
+            writer.write('HTTP/1.0 404 Not Found\r\n\r\n')
+            await writer.drain()
+        await writer.aclose()
+    except Exception as e:
+        print("HTTP handler error:", e)
+        try:
+            await writer.aclose()
+        except:
+            pass
+
+# -------------------- main tasks --------------------
+async def sensor_task():
+    global last_alert_time
+    while True:
+        try:
+            # read sensors (prefer BME if present)
+            td, hd = read_dht()
+            tb, hb, pres = read_bme()
+            if tb is not None:
+                state["temp"] = tb
+                state["hum"] = hb
+                state["pres"] = pres
+            else:
+                state["temp"] = td
+                state["hum"] = hd
+            state["lux"] = read_lux()
+            state["voc_adc"] = read_mq135()
+            state["pm_raw"] = read_sharp()
+            state["pir"] = pir.value()
+
+            # compute score
+            score = compute_score(state["voc_adc"], state["pm_raw"], state["temp"], state["hum"])
+
+            # state machine & actions
+            now = time.time()
+            if score >= 2:
+                state["system_state"] = "ALERTA"
+                relay.value(1)        # ventilación ON
+                start_buzzer(1400)
+                status_led.value(1)
+                # send telegram alert (cooldown)
+                if now - last_alert_time > ALERT_COOLDOWN:
+                    telegram_send(ADMIN_CHAT_ID, "ALERTA QxBioSafe: score {}. Temp:{:.1f}C Hum:{:.1f}% VOC:{} PM:{}".format(
+                        score, state.get("temp") or -1, state.get("hum") or -1, state.get("voc_adc"), state.get("pm_raw")
+                    ))
+                    last_alert_time = now
+            elif score == 1:
+                state["system_state"] = "VIGILANCIA"
+                relay.value(1)
+                stop_buzzer()
+                status_led.value(1)
+            else:
+                state["system_state"] = "NORMAL"
+                relay.value(0)
+                stop_buzzer()
+                status_led.value(0)
+
+        except Exception as e:
+            print("Sensor task error:", e)
+        await asyncio.sleep(SENSOR_INTERVAL)
+
+async def main():
+    ok = connect_wifi()
+    if not ok:
+        print("WiFi not connected, still starting tasks (web may fail)")
+    else:
+        state["ip"] = wlan.ifconfig()[0]
+        telegram_send(ADMIN_CHAT_ID, "QxBioSafe iniciado. IP: {}".format(state["ip"]))
+
+    # start tasks: sensors, telegram polling, web server
+    tasks = [
+        asyncio.create_task(sensor_task()),
+        asyncio.create_task(telegram_polling()),
+        asyncio.create_task(asyncio.start_server(http_handler, "0.0.0.0", 80)),
+    ]
+    await asyncio.gather(*tasks)
+
+# ---------- run ----------
+try:
+    asyncio.run(main())
+finally:
+    stop_buzzer()
+    try:
+        asyncio.new_event_loop()
+    except:
+        pass
